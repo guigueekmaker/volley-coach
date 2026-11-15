@@ -242,6 +242,7 @@ const DEFAULT_SETTINGS={sets:5,points:25,decider:15,diff:2};
 const uid=()=>Math.random().toString(36).slice(2,9)+Date.now().toString(36).slice(-4);
 /* index 0..5 = postes P1..P6 ; rotation horaire : le joueur du P2 passe au service (P1) */
 const rot=l=>[l[1],l[2],l[3],l[4],l[5],l[0]];
+const stamp=m=>m.updatedAt||m.createdAt||0;
 
 function derive(set){
   let lineup=set.start.lineup.slice(), bench=set.start.bench.slice(), serving=set.start.serving, us=0, them=0, last=null;
@@ -351,7 +352,11 @@ function load(){
   return {matches:[]};
 }
 let db=load();
-function save(){try{localStorage.setItem(KEY,JSON.stringify(db));}catch(e){storageOk=false;}}
+function save(){
+  const cur=ui.matchId?db.matches.find(m=>m.id===ui.matchId):null;
+  if(cur&&cur.phase!=='finished')cur.updatedAt=Date.now();
+  try{localStorage.setItem(KEY,JSON.stringify(db));}catch(e){storageOk=false;}
+}
 
 /* ---------- utilitaires ---------- */
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -387,6 +392,7 @@ function vHome(){
     <button class="btn primary xl" data-action="new-match">Nouveau match</button>
     <h2 class="sec">Historique</h2>
     ${done.length?`<div class="hlist">${done.map(hcard).join('')}</div>`:`<p class="empty">Aucun match enregistré pour l'instant. Lancez un match pour suivre le score et les statistiques.</p>`}
+    ${syncCard()}
     <button class="linkbtn" data-action="lock">Verrouiller l'app</button>`;
 }
 function resultOf(m){const t=setsTally(m);return t.us>t.them?'win':t.us<t.them?'loss':'draw';}
@@ -561,6 +567,135 @@ let wakeLock=null;
 function keepAwake(){try{if(ui.view==='live'&&navigator.wakeLock&&!wakeLock){navigator.wakeLock.request('screen').then(l=>{wakeLock=l;l.addEventListener('release',()=>{wakeLock=null;});}).catch(()=>{});}}catch(e){}}
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')keepAwake();});
 
+/* ---------- synchronisation GitHub ---------- */
+const SYNC_KEY='volley-coach-sync';
+const SYNC_DEFAULT=()=>({repo:'',token:'',shas:{},pending:[],lastSync:0,error:''});
+function loadSync(){
+  try{const d=JSON.parse(localStorage.getItem(SYNC_KEY)||'null');if(d&&typeof d==='object')return {...SYNC_DEFAULT(),...d};}catch(e){}
+  return SYNC_DEFAULT();
+}
+let syncCfg=loadSync();
+function saveSync(){try{localStorage.setItem(SYNC_KEY,JSON.stringify(syncCfg));}catch(e){}}
+
+/* ===== SYNC START ===== */
+const API='https://api.github.com/repos/';
+const b64enc=s=>btoa(unescape(encodeURIComponent(s)));
+const b64dec=s=>decodeURIComponent(escape(atob(String(s).replace(/\s/g,''))));
+function failStatus(r){
+  if(r.status===401)return new Error('Jeton GitHub refusé ou expiré.');
+  if(r.status===403)return new Error('Accès refusé par GitHub (droits du jeton ou limite atteinte).');
+  if(r.status===404)return new Error('Dépôt introuvable, ou jeton sans accès à ce dépôt.');
+  return new Error('Erreur GitHub '+r.status+'.');
+}
+async function ghReq(method,path,body){
+  const h={'Accept':'application/vnd.github+json','Authorization':'Bearer '+syncCfg.token,'X-GitHub-Api-Version':'2022-11-28'};
+  if(body)h['Content-Type']='application/json';
+  try{return await fetch(API+syncCfg.repo+path,{method,cache:'no-store',headers:h,body:body?JSON.stringify(body):undefined});}
+  catch(e){throw new Error('Hors connexion : synchronisation en attente.');}
+}
+function validRemote(rm,id){
+  return !!rm&&typeof rm==='object'&&rm.id===id&&rm.phase==='finished'&&Array.isArray(rm.roster)&&!!rm.settings&&typeof rm.settings==='object'
+    &&Array.isArray(rm.sets)&&rm.sets.every(s=>s&&Array.isArray(s.events)&&s.start&&Array.isArray(s.start.lineup)&&Array.isArray(s.start.bench));
+}
+async function pushMatch(m){
+  const body={message:`Match vs ${m.opponent} (${m.date})`,content:b64enc(JSON.stringify(m))};
+  const known=syncCfg.shas[m.id];
+  if(known&&known.sha)body.sha=known.sha;
+  const path='/contents/data/'+m.id+'.json';
+  let r=await ghReq('PUT',path,body);
+  if(r.status===409||r.status===422){
+    const g=await ghReq('GET',path);
+    if(g.ok)body.sha=(await g.json()).sha;else delete body.sha;
+    r=await ghReq('PUT',path,body);
+  }
+  if(!r.ok)throw failStatus(r);
+  const j=await r.json();
+  syncCfg.shas[m.id]={sha:j.content.sha,at:stamp(m)};
+}
+async function doSync(){
+  const s=syncCfg;
+  if(!s.shas)s.shas={};if(!s.pending)s.pending=[];
+  /* 1. suppressions en attente */
+  for(const p of s.pending){
+    const r=await ghReq('DELETE','/contents/data/'+p.id+'.json',{message:'Suppression d\'un match',sha:p.sha});
+    if(!(r.ok||r.status===404||r.status===409||r.status===422))throw failStatus(r);
+  }
+  s.pending=[];
+  /* 2. lecture du dépôt */
+  const r=await ghReq('GET','/contents/data');
+  let remote=[];
+  if(r.status===404){const rr=await ghReq('GET','');if(!rr.ok)throw failStatus(rr);}
+  else if(!r.ok)throw failStatus(r);
+  else remote=(await r.json()).filter(f=>f.type==='file'&&/\.json$/.test(f.name));
+  const remoteIds=new Set();
+  for(const f of remote){
+    const id=f.name.replace(/\.json$/,'');remoteIds.add(id);
+    const e=s.shas[id];if(e&&e.sha===f.sha)continue;
+    const fr=await ghReq('GET','/contents/data/'+f.name);if(!fr.ok)throw failStatus(fr);
+    const j=await fr.json();let rm=null;
+    try{rm=JSON.parse(b64dec(j.content));}catch(_){}
+    if(!validRemote(rm,id))continue;
+    const local=db.matches.find(x=>x.id===id);
+    if(!local||stamp(rm)>stamp(local)){
+      if(local)db.matches[db.matches.indexOf(local)]=rm;else db.matches.push(rm);
+      s.shas[id]={sha:j.sha,at:stamp(rm)};
+    }else s.shas[id]={sha:j.sha,at:e?e.at:-1};
+  }
+  /* 3. matchs supprimés depuis un autre appareil */
+  for(const id of Object.keys(s.shas)){
+    if(remoteIds.has(id))continue;
+    const e=s.shas[id],local=db.matches.find(x=>x.id===id);
+    delete s.shas[id];
+    if(local&&local.phase==='finished'&&stamp(local)===e.at)db.matches=db.matches.filter(x=>x!==local);
+  }
+  /* 4. envoi des matchs terminés nouveaux ou modifiés */
+  for(const m of db.matches.filter(x=>x.phase==='finished')){
+    const e=s.shas[m.id];if(e&&e.at===stamp(m))continue;
+    await pushMatch(m);
+  }
+}
+function dirtyCount(){
+  return db.matches.filter(m=>m.phase==='finished'&&!(syncCfg.shas[m.id]&&syncCfg.shas[m.id].at===stamp(m))).length+syncCfg.pending.length;
+}
+/* ===== SYNC END ===== */
+
+let syncing=false,syncAgain=false;
+async function syncNow(manual){
+  if(!syncCfg.repo||!syncCfg.token){if(manual)toast('Synchronisation non configurée.');return;}
+  if(syncing){syncAgain=true;return;}
+  syncing=true;if(ui.view==='home')render();
+  try{await doSync();syncCfg.lastSync=Date.now();syncCfg.error='';if(manual)toast('Historique synchronisé');}
+  catch(e){syncCfg.error=e.message||'Erreur de synchronisation.';if(manual)toast(syncCfg.error);}
+  syncing=false;save();saveSync();
+  if(['home','detail','sync'].includes(ui.view)&&isUnlocked())render();
+  if(syncAgain){syncAgain=false;syncNow();}
+}
+function syncCard(){
+  const s=syncCfg,on=s.repo&&s.token;let status;
+  if(!on)status='Non configurée : les matchs restent sur cet appareil.';
+  else if(syncing)status='Synchronisation en cours…';
+  else if(s.error)status='Attention : '+s.error;
+  else{
+    const n=dirtyCount();
+    const at=s.lastSync?new Date(s.lastSync).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'';
+    status=n?`${n} élément${n>1?'s':''} en attente d'envoi.`:('Historique synchronisé'+(at?' à '+at:'')+' · '+s.repo);
+  }
+  return `<section class="card"><h2>Synchronisation GitHub</h2><p class="hint">${esc(status)}</p>
+    <div class="endrow">${on?'<button class="btn sm" data-action="sync-now">Synchroniser</button>':''}<button class="btn sm ghost" data-action="sync-settings">${on?'Réglages':'Configurer'}</button></div></section>`;
+}
+function vSync(){
+  const s=syncCfg;
+  return `<header class="top"><button class="back" data-action="home">${ICON.back}<span>Accueil</span></button><h1>Synchronisation</h1></header>
+  <section class="card"><p>Chaque match terminé est enregistré dans un dépôt GitHub public, dans le dossier <b>data</b>, et relu au démarrage sur chaque appareil.</p>
+    <label class="lbl" for="sy-repo">Dépôt (pseudo/nom)</label>
+    <input id="sy-repo" class="inp" value="${esc(s.repo||'')}" placeholder="pseudo/volley-data" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <label class="lbl" for="sy-token">Jeton d'accès GitHub</label>
+    <input id="sy-token" class="inp" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${s.token?'Jeton enregistré (laisser vide pour le garder)':'github_pat_…'}">
+    <p class="hint">Jeton « fine-grained » limité à ce seul dépôt, avec la permission Contents : lecture et écriture. Il reste uniquement sur cet appareil.</p>
+    <button class="btn primary" data-action="sync-save">Enregistrer et synchroniser</button>
+    ${s.repo?'<button class="btn ghost" data-action="sync-off" style="color:var(--lost)">Désactiver la synchronisation</button>':''}</section>`;
+}
+
 /* ---------- accès par mot de passe (simple verrou d'interface) ---------- */
 const PW_HASH=2844146400562977, LOCK_KEY='volley-coach-unlock';
 function pwHash(str){
@@ -580,7 +715,7 @@ function tryUnlock(){
   const inp=document.getElementById('pw'),v=inp?inp.value:'';
   if(pwHash('volley-coach:'+v)===PW_HASH){
     unlockedMem=true;try{localStorage.setItem(LOCK_KEY,String(PW_HASH));}catch(e){}
-    render();
+    render();syncNow();
   }else{
     const err=document.getElementById('pw-err');if(err)err.hidden=false;
     if(inp){inp.value='';inp.focus();}
@@ -607,7 +742,7 @@ function render(){
   const m=ui.matchId?M():null;
   if(['config','live','detail'].includes(ui.view)&&!m){ui.view='home';}
   if(ui.view==='live'&&(!m||m.phase!=='playing')){ui.view=m&&m.phase==='config'?'config':'home';}
-  const views={home:vHome,new:vNew,config:vConfig,live:vLive,detail:vDetail};
+  const views={home:vHome,new:vNew,config:vConfig,live:vLive,detail:vDetail,sync:vSync};
   document.getElementById('app').innerHTML=`<div class="wrap">${views[ui.view]()}</div>`;
   document.getElementById('sheet-root').innerHTML=sheetHtml();
   keepAwake();
@@ -617,7 +752,9 @@ function render(){
 function newDraft(){ui.newDraft={opponent:'',date:todayISO(),settings:{...DEFAULT_SETTINGS},roster:[]};go('new');}
 function finalize(m){
   if(!matchHasPoints(m))db.matches=db.matches.filter(x=>x!==m);
+  else m.updatedAt=Date.now();
   save();
+  syncNow();
 }
 function doSub(idx,inId){
   const m=M(),set=currentSet(m),d=derive(set),outId=d.lineup[idx];
@@ -633,6 +770,18 @@ function act(a,d){
   switch(a){
     case 'home':go('home');break;
     case 'unlock':tryUnlock();break;
+    case 'sync-now':syncNow(true);break;
+    case 'sync-settings':go('sync');break;
+    case 'sync-save':{
+      const repo=(document.getElementById('sy-repo').value||'').trim().replace(/^https?:\/\/github\.com\//,'').replace(/\.git$/,'').replace(/\/+$/,'');
+      let tok=(document.getElementById('sy-token').value||'').trim();
+      if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){toast('Dépôt invalide : format pseudo/nom.');break;}
+      if(!tok)tok=syncCfg.token||'';
+      if(!tok){toast('Ajoutez le jeton GitHub.');break;}
+      if(repo!==syncCfg.repo){syncCfg.shas={};syncCfg.pending=[];}
+      syncCfg.repo=repo;syncCfg.token=tok;syncCfg.error='';saveSync();go('home');syncNow(true);break;}
+    case 'sync-off':
+      syncCfg.repo='';syncCfg.token='';syncCfg.shas={};syncCfg.pending=[];syncCfg.error='';saveSync();toast('Synchronisation désactivée');go('home');break;
     case 'lock':lockApp();break;
     case 'new-match':
       if(db.matches.some(x=>x.phase!=='finished')){
@@ -706,7 +855,8 @@ function act(a,d){
       const dm=db.matches.find(x=>x.id===d.id);
       ui.sheet={title:'Supprimer ce match ?',text:`Le match contre ${dm.opponent} et toutes ses statistiques seront supprimés définitivement.`,buttons:[{label:'Supprimer',action:'delete-match',id:dm.id,cls:'lost'}]};render();break;}
     case 'delete-match':
-      db.matches=db.matches.filter(x=>x.id!==d.id);save();toast('Match supprimé');
+      if(syncCfg.shas[d.id]){syncCfg.pending.push({id:d.id,sha:syncCfg.shas[d.id].sha});delete syncCfg.shas[d.id];saveSync();}
+      db.matches=db.matches.filter(x=>x.id!==d.id);save();toast('Match supprimé');syncNow();
       ui.sheet=null;ui.view='home';render();window.scrollTo(0,0);break;
   }
 }
@@ -764,8 +914,10 @@ document.addEventListener('pointerup',e=>{
   }else if(ui.view==='live'&&m&&kind==='court'&&d.kind==='bench'){doSub(Number(arg),d.id);}
 });
 document.addEventListener('pointercancel',endDrag);
+window.addEventListener('online',()=>{if(isUnlocked())syncNow();});
 
 render();
+if(isUnlocked())syncNow();
 </script>
 
 </body>
